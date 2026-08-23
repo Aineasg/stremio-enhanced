@@ -232,3 +232,31 @@ xattr -d com.apple.quarantine /path/to/Stremio.Enhanced.app
 ### Important Note: Currently, the latest official Windows version of Stremio Service on GitHub includes faulty FFmpeg binaries. This can lead to issues like no audio in streams. To fix this for the time being, you can either use server.js directly or replace the ffmpeg binaries using the following steps:
 - download ffmpeg from here https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip
 - extract the zip archive to local appdata > programs > StremioService and select replace existing files.
+## Update v1.2.1 - security & stability pass (second audit)
+- Fixed theme application: themes are now injected as `<style>` content instead of `<link href="file://...">`, which Chromium blocks on https:// pages (themes were silently broken since webSecurity was enabled).
+- Fixed "Check for updates": it ran in the main process where no DOM exists and failed whenever an update was actually available; it now shows a native dialog from the main process.
+- Fixed duplicate `--disable-features` Chromium switch (main.ts + GPU controller) that could silently re-enable Private Network Access restrictions and break the local streaming server.
+- Fixed packaging: the electron-builder `files` list excluded `dist/`, so packaged AppImage/NSIS/DMG builds could not contain the compiled app. `dist/**` and `version` are now packaged.
+- electron-builder: set Linux desktop entry name (`desktopName` + `syncDesktopName`) and proper `category` (AudioVideo) - fixes WM_CLASS/window association warnings.
+- Security: blocked SSRF / local-network probing through plugin `updateUrl` update checks (private, loopback, link-local and metadata IP ranges are now refused; only standard ports).
+- Security: escaped stream-supplied audio track labels in the audio-track menu (XSS via crafted HLS playlists).
+- Security: clamped and control-character-stripped plugin log input (log forging / unbounded logging from the renderer).
+- Security: validated `drag-window` IPC coordinates in the main process.
+- Hardening: all download helpers (FFmpeg archives, Stremio Service installer) now cap redirects (5), cap size (1 GiB), verify per-hop status codes, enforce https, and delete partial files on failure.
+- Robustness: one malformed marketplace entry or local mod file no longer breaks the whole marketplace/settings page; missing mod directories no longer crash the preload.
+- Tooling: added `eslint` + `@typescript-eslint` devDependencies and a `.eslintrc.json` so `npm run lint` works out of the box.
+
+## Update v1.2.2 - audio track switching robustness
+- Audio-track menu now survives Stremio Web UI updates: if the stock audio button can't be identified by its icon signature, Enhanced injects its own speaker button into the control bar instead of silently giving up.
+- Track detection retries for ~5s after `loadedmetadata` (HLS multi-audio manifests sometimes parse late).
+- Detection now also matches Stremio's audio button when it is hidden rather than disabled, and un-hides it.
+- Detailed logging of detected track languages to make remote diagnosis trivial (watch the console: it now lists e.g. `Found 3 native audio tracks: jpn, eng, und`).
+
+## Update v1.2.3 - audio detection race fix
+- Fixed a race condition in audio-track detection: when the video's metadata was already loaded before Enhanced attached its hook (fast stream loads / navigating within the player), the `loadedmetadata` event never fired and the language button stayed permanently grayed out even though multiple tracks existed. Detection now runs immediately when `video.readyState >= 1`.
+- Track re-check window extended from ~5s to ~8s for slow HLS manifest parsing.
+
+## Update v1.2.4 - critical: preload script was failing to load entirely
+- Root cause of the grayed-out audio button (and dead plugins/themes/Enhanced settings since the first patched build): the previous hardening pass set `sandbox: true` in the BrowserWindow, but Electron sandboxed preload scripts can only require a tiny builtin whitelist (electron/events/timers/url) - they cannot load local module files. The multi-file preload died at startup with "Unable to load preload script / module not found ../core/Updater", so NONE of the enhanced features ever ran.
+- Fix: `sandbox: false` (explicit) while keeping `nodeIntegration: false` + `contextIsolation: true` - the page still has zero Node access; only the curated contextBridge API is exposed. This matches how the preload architecture of this app is designed.
+- How to verify: launch the app, open DevTools (Ctrl+Shift+I) - the old "Unable to load preload script" error is gone, Settings gains the "Enhanced" section, and the audio-language button enables during multi-audio playback.

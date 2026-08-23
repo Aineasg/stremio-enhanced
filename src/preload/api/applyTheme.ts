@@ -4,6 +4,8 @@ import { STORAGE_KEYS } from "../../constants";
 import { alertAPI } from "./alert";
 import ExtractMetaData from "../../utils/ExtractMetaData";
 import { join } from "path";
+import { isSafeFileName } from "../../utils/sanitize";
+import { applyThemeStylesheet } from "../../utils/themeLoader";
 
 const logger = getLogger("applyThemeAPI");
 
@@ -12,6 +14,13 @@ export const applyThemeAPI = {
         logger.info("Attempting to apply " + theme);
 
         if (theme !== "Default") {
+            // SECURITY: theme comes from a data-attribute or from
+            // localStorage.  Reject any value that's not a safe leaf
+            // file name to prevent path traversal.
+            if (!isSafeFileName(theme)) {
+                logger.error(`Refused to apply theme with unsafe name: ${JSON.stringify(theme)}`);
+                return;
+            }
             const themePath = join(Properties.themesPath, theme);
             const themeMetaData = ExtractMetaData.extractMetadataFromFile(themePath);
 
@@ -41,12 +50,15 @@ export const applyThemeAPI = {
         }
 
         if (theme !== "Default") {      
-            const themeElement = document.createElement("link");
-            themeElement.id = "activeTheme";
-            themeElement.rel = "stylesheet";
-            themeElement.href = `${Properties.themesPath}/${theme}`;
-
-            document.head.appendChild(themeElement);
+            // Re-validate before using - defense in depth.
+            if (!isSafeFileName(theme)) {
+                return;
+            }
+            // SECURITY + FIX: inject the CSS text via <style> instead of
+            // <link href="file://..."> - file:// subresources are blocked
+            // on https:// pages now that webSecurity is (correctly)
+            // enabled, which silently broke all link-based themes.
+            applyThemeStylesheet(theme);
         }
 
         const currentTheme = localStorage.getItem("currentTheme");

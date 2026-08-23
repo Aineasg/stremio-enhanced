@@ -1,4 +1,5 @@
 import TemplateCache from "../../utils/templateCache";
+import { escapeHtml } from "../../utils/sanitize";
 
 export async function getToastTemplate(id: string, title: string, message: string, status: "success" | "fail" | "info"): Promise<string> {
     let template = TemplateCache.load(__dirname, 'toast');
@@ -16,9 +17,12 @@ export async function getToastTemplate(id: string, title: string, message: strin
             break;
     }
     
+    // SECURITY: id, title, message can be plugin-supplied.
+    // Escape all dynamic text and the id attribute to prevent XSS
+    // via toast notifications.
     return template
-        .replace("{{ id }}", id)
-        .replace("{{ title }}", title)
-        .replace("{{ message }}", message)
-        .replace("{{ status }}", toastStatus);
+        .replace("{{ id }}", escapeHtml(id))
+        .replace("{{ title }}", escapeHtml(title))
+        .replace("{{ message }}", escapeHtml(message))
+        .replace("{{ status }}", escapeHtml(toastStatus));
 }

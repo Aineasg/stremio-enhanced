@@ -1,4 +1,4 @@
-import { readdirSync } from "fs";
+import { readdirSync, existsSync } from "fs";
 import { join } from "path";
 import { settingsBuilder } from "./settingsBuilder";
 import properties from "../../../core/Properties";
@@ -48,9 +48,16 @@ function writeAbout(): void {
 export function checkSettings() {
     if (!location.href.includes("#/settings")) return;
     if (document.querySelector(`a[href="#settings-enhanced"]`)) return;
-        
-    const themesList = readdirSync(properties.themesPath).filter(f => f.endsWith(FILE_EXTENSIONS.THEME));
-    const pluginsList = readdirSync(properties.pluginsPath).filter(f => f.endsWith(FILE_EXTENSIONS.PLUGIN));
+
+    // ROBUSTNESS: the mod directories may not exist yet (e.g. very
+    // first run, or directory creation failed) - don't crash the
+    // preload / settings page over a missing folder.
+    const themesList = existsSync(properties.themesPath)
+        ? readdirSync(properties.themesPath).filter(f => f.endsWith(FILE_EXTENSIONS.THEME))
+        : [];
+    const pluginsList = existsSync(properties.pluginsPath)
+        ? readdirSync(properties.pluginsPath).filter(f => f.endsWith(FILE_EXTENSIONS.PLUGIN))
+        : [];
     
     logger.info("Adding 'Enhanced' sections...");
     settingsBuilder.addSection("enhanced", "Enhanced");
@@ -77,17 +84,29 @@ export function checkSettings() {
         document.querySelector(SELECTORS.THEMES_CATEGORY)?.insertAdjacentHTML("afterbegin", getDefaultThemeTemplate(isCurrentThemeDefault));
         
         themesList.forEach(theme => {
-            const metaData = ExtractMetaData.extractMetadataFromFile(join(properties.themesPath, theme));
-            if (metaData && metaData.name.toLowerCase() !== "default") {
-                settingsBuilder.addItem("theme", theme, { ...metaData });
+            // ROBUSTNESS: render each theme independently - a file with
+            // a hostile name / broken metadata must not break the whole
+            // settings page (the item template throws on unsafe names).
+            try {
+                const metaData = ExtractMetaData.extractMetadataFromFile(join(properties.themesPath, theme));
+                if (metaData && metaData.name.toLowerCase() !== "default") {
+                    settingsBuilder.addItem("theme", theme, { ...metaData });
+                }
+            } catch (err) {
+                logger.error(`Skipped malformed theme "${theme}": ${err}`);
             }
         });
     }).catch(err => logger.error("Failed to setup themes: " + err));
     
     pluginsList.forEach(plugin => {
-        const metaData = ExtractMetaData.extractMetadataFromFile(join(properties.pluginsPath, plugin));
-        if (metaData) {
-            settingsBuilder.addItem("plugin", plugin, { ...metaData });
+        // ROBUSTNESS: see note above.
+        try {
+            const metaData = ExtractMetaData.extractMetadataFromFile(join(properties.pluginsPath, plugin));
+            if (metaData) {
+                settingsBuilder.addItem("plugin", plugin, { ...metaData });
+            }
+        } catch (err) {
+            logger.error(`Skipped malformed plugin "${plugin}": ${err}`);
         }
     });
     

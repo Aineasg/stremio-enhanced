@@ -8,11 +8,16 @@ import { STORAGE_KEYS, SELECTORS, CLASSES, FILE_EXTENSIONS } from "../../../cons
 import { settingsAPI } from "../../api/settings";
 import { pluginOptionsModal } from "../../../components/plugin-settings-modal/pluginSettingsModal";
 import PluginSettingSchema from "../../../interfaces/PluginSettingSchema";
+import { escapeJsString, isSafeFileName } from "../../../utils/sanitize";
 
 const logger = getLogger("ModController");
 
 export const modController = {
     loadPlugin: (pluginName: string): void => {
+        if (!isSafeFileName(pluginName)) {
+            logger.error(`Refusing to load plugin with unsafe file name: ${JSON.stringify(pluginName)}`);
+            return;
+        }
         if (document.getElementById(pluginName)) return;
 
         const pluginContent = ModManager.getPluginContent(pluginName);
@@ -23,33 +28,41 @@ export const modController = {
 
         const pluginBaseName = pluginName.split(FILE_EXTENSIONS.PLUGIN)[0];
 
+        // SECURITY: pluginBaseName and pluginName are interpolated into
+        // a JavaScript wrapper that is then injected as a <script>.
+        // Without escaping, a plugin with a filename containing quotes
+        // or backticks could break out of the wrapper and execute
+        // arbitrary code in the page context.
+        const safeBase = escapeJsString(pluginBaseName);
+        const safeName = escapeJsString(pluginName);
+
         const scopedScript = `
         (function() {
             const StremioEnhancedAPI = {
                 logger: {
-                    info: (message) => window.StremioEnhancedAPI.info('${pluginBaseName}', message),
-                    warn: (message) => window.StremioEnhancedAPI.warn('${pluginBaseName}', message),
-                    error: (message) => window.StremioEnhancedAPI.error('${pluginBaseName}', message)
+                    info: (message) => window.StremioEnhancedAPI.info('${safeBase}', message),
+                    warn: (message) => window.StremioEnhancedAPI.warn('${safeBase}', message),
+                    error: (message) => window.StremioEnhancedAPI.error('${safeBase}', message)
                 },
-                getSetting: (key) => window.StremioEnhancedAPI.getSetting('${pluginBaseName}', key),
-                saveSetting: (key, value) => window.StremioEnhancedAPI.saveSetting('${pluginBaseName}', key, value),
-                registerSettings: (schema) => window.StremioEnhancedAPI.registerSettings('${pluginBaseName}', schema),
-                onSettingsSaved: (callback) => window.StremioEnhancedAPI.onSettingsSaved('${pluginBaseName}', callback),
+                getSetting: (key) => window.StremioEnhancedAPI.getSetting('${safeBase}', key),
+                saveSetting: (key, value) => window.StremioEnhancedAPI.saveSetting('${safeBase}', key, value),
+                registerSettings: (schema) => window.StremioEnhancedAPI.registerSettings('${safeBase}', schema),
+                onSettingsSaved: (callback) => window.StremioEnhancedAPI.onSettingsSaved('${safeBase}', callback),
                 
                 showAlert: window.StremioEnhancedAPI.showAlert,
-                showPrompt: (title, message, defaultValue) => window.StremioEnhancedAPI.showPrompt('${pluginBaseName}', title, message, defaultValue)
+                showPrompt: (title, message, defaultValue) => window.StremioEnhancedAPI.showPrompt('${safeBase}', title, message, defaultValue)
             };
 
             try {
                 ${pluginContent}
             } catch (err) {
-                console.error('[ModController] Plugin crashed: ${pluginName}', err);
+                console.error('[ModController] Plugin crashed: ${safeName}', err);
             }
         })();
         `;
 
         const script = document.createElement("script");
-        script.innerHTML = scopedScript;
+        script.textContent = scopedScript;
         script.id = pluginName;
         document.body.appendChild(script);
         

@@ -1,13 +1,25 @@
-import { fork, execSync } from "child_process";
+import { fork, execSync, execFile } from "child_process";
 import * as unzipper from "unzipper";
-import { createWriteStream, existsSync, mkdirSync, chmodSync, unlinkSync, readFileSync, writeFileSync } from "fs";
-import { join } from "path";
+import { createWriteStream, existsSync, mkdirSync, chmodSync, unlinkSync, readFileSync, writeFileSync, renameSync, rmSync } from "fs";
+import { join, resolve, isAbsolute, relative } from "path";
 import { getLogger } from "./logger";
 import Properties from "../core/Properties";
 import https from "https";
 import { shell } from "electron";
 import { FFMPEG_URLS, MACOS_FFPROBE_URLS } from "../constants";
 import Helpers from "./Helpers";
+
+const execFileAsync = (cmd: string, args: string[]) =>
+    new Promise<void>((resolvePromise, reject) => {
+        execFile(cmd, args, (err) => {
+            if (err) reject(err); else resolvePromise();
+        });
+    });
+
+// Hardening limits for all downloads: a redirect loop must not hang
+// the app and a hijacked / oversized response must not fill the disk.
+const MAX_REDIRECTS = 5;
+const MAX_DOWNLOAD_BYTES = 1024 * 1024 * 1024; // 1 GiB hard ceiling for ffmpeg archives
 
 class StreamingServer {
     private static logger = getLogger("StreamingServer");
@@ -54,6 +66,14 @@ class StreamingServer {
 
     // Check if system ffmpeg/ffprobe are available and working
     private static getSystemBinaryPath(binary: string): string | null {
+        // SECURITY: `binary` is hardcoded by us ("ffmpeg" or "ffprobe")
+        // so there's no command-injection surface here, but we still
+        // harden it so future callers can't accidentally pass untrusted
+        // values.
+        if (!/^[a-zA-Z0-9_-]+$/.test(binary)) {
+            this.logger.error(`Refusing to look up system binary with invalid name: ${binary}`);
+            return null;
+        }
         try {
             const result = execSync(`which ${binary}`, { encoding: "utf8", stdio: ["pipe", "pipe", "pipe"] });
             const path = result.trim();
@@ -99,12 +119,46 @@ class StreamingServer {
 
     private static async downloadFile(url: string, dest: string): Promise<void> {
         return new Promise((resolve, reject) => {
+            let redirects = 0;
+            let bytesWritten = 0;
+            let settled = false;
+
+            const fail = (err: Error) => {
+                if (settled) return;
+                settled = true;
+                // Remove a partial download so a truncated archive is
+                // never mistaken for a complete one later.
+                try { unlinkSync(dest); } catch { /* nothing to clean up */ }
+                reject(err);
+            };
+
             const file = createWriteStream(dest);
+            file.on("error", fail);
 
             const request = (downloadUrl: string) => {
+                let parsedUrl: URL;
+                try {
+                    parsedUrl = new URL(downloadUrl);
+                } catch (err) {
+                    fail(err as Error);
+                    return;
+                }
+                // SECURITY: never follow a redirect that downgrades to a
+                // non-https scheme (https.get would throw anyway, but be
+                // explicit about it).
+                if (parsedUrl.protocol !== "https:") {
+                    fail(new Error(`Refusing non-https download URL: ${downloadUrl}`));
+                    return;
+                }
+
                 https.get(downloadUrl, { headers: { "User-Agent": "Stremio-Enhanced" } }, (res) => {
                     // Handle redirects (GitHub releases use redirects)
                     if (res.statusCode && res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+                        res.resume(); // drain the redirect body
+                        if (++redirects > MAX_REDIRECTS) {
+                            fail(new Error(`Too many redirects downloading ${url}`));
+                            return;
+                        }
                         const redirectUrl = new URL(res.headers.location, downloadUrl).toString();
                         this.logger.info(`Following redirect to: ${redirectUrl}`);
                         request(redirectUrl);
@@ -112,22 +166,33 @@ class StreamingServer {
                     }
 
                     if (res.statusCode !== 200) {
-                        file.close();
-                        reject(new Error(`Failed to download ${url}: HTTP ${res.statusCode}`));
+                        res.resume();
+                        fail(new Error(`Failed to download ${url}: HTTP ${res.statusCode}`));
                         return;
                     }
 
+                    res.on("data", (chunk: Buffer) => {
+                        bytesWritten += chunk.length;
+                        if (bytesWritten > MAX_DOWNLOAD_BYTES) {
+                            fail(new Error(`Download of ${url} exceeded ${MAX_DOWNLOAD_BYTES} byte limit`));
+                            res.destroy();
+                            file.close();
+                        }
+                    });
+
                     res.pipe(file);
                     file.on("finish", () => {
-                        file.close(() => resolve());
+                        file.close(() => {
+                            if (!settled) { settled = true; resolve(); }
+                        });
                     });
                     res.on("error", (err) => {
                         file.close();
-                        reject(err);
+                        fail(err);
                     });
                 }).on("error", (err) => {
                     file.close();
-                    reject(err);
+                    fail(err);
                 });
             };
 
@@ -152,32 +217,50 @@ class StreamingServer {
             this.logger.info("FFmpeg archive downloaded. Extracting...");
 
             if (process.platform === "linux") {
-                // Extract tar.xz archive
-                // First, list contents to find the directory name
-                const listOutput = execSync(`tar -tf "${archivePath}" | head -1`, { encoding: "utf8" });
-                const extractDir = listOutput.trim().split("/")[0];
+                // SECURITY: use execFile (no shell) instead of execSync
+                // with template strings.  Even though archivePath and
+                // streamingServerDir are derived from app-controlled
+                // paths, the previous template-string approach would
+                // allow an attacker controlling APPDATA / HOME to
+                // inject shell metacharacters into the command line.
 
-                // Extract the archive
-                execSync(`tar -xf "${archivePath}" -C "${this.streamingServerDir}"`, { encoding: "utf8" });
+                // List contents (one line) - safe execFile
+                const listResult = await new Promise<string>((resolvePromise, reject) => {
+                    execFile("tar", ["-tf", archivePath], (err, stdout) => {
+                        if (err) reject(err); else resolvePromise(stdout);
+                    });
+                });
+                const firstLine = listResult.split("\n").find(l => l.trim().length > 0) ?? "";
+                const extractDir = firstLine.trim().split("/")[0];
+                if (!extractDir || extractDir.includes("..")) {
+                    throw new Error("Refusing to extract archive with suspicious top-level directory");
+                }
 
-                // Move ffmpeg and ffprobe to the streamingserver directory
+                await execFileAsync("tar", ["-xf", archivePath, "-C", this.streamingServerDir]);
+
                 const extractedDir = join(this.streamingServerDir, extractDir);
-                execSync(`mv "${join(extractedDir, "ffmpeg")}" "${ffmpegPath}"`, { encoding: "utf8" });
-                execSync(`mv "${join(extractedDir, "ffprobe")}" "${ffprobePath}"`, { encoding: "utf8" });
 
-                // Set executable permissions
+                // Use Node's fs to move files instead of shell `mv`.
+                const extractedFfmpeg = join(extractedDir, "ffmpeg");
+                const extractedFfprobe = join(extractedDir, "ffprobe");
+                if (existsSync(extractedFfmpeg)) renameSync(extractedFfmpeg, ffmpegPath);
+                if (existsSync(extractedFfprobe)) renameSync(extractedFfprobe, ffprobePath);
+
                 chmodSync(ffmpegPath, 0o755);
                 chmodSync(ffprobePath, 0o755);
 
-                // Cleanup: remove extracted directory and archive
-                execSync(`rm -rf "${extractedDir}"`, { encoding: "utf8" });
+                // Use Node's fs to remove the extracted directory
+                // instead of `rm -rf` via shell.
+                if (existsSync(extractedDir)) {
+                    rmSync(extractedDir, { recursive: true, force: true });
+                }
                 unlinkSync(archivePath);
 
                 this.logger.info("FFmpeg and FFprobe extracted successfully.");
                 return true;
             } else if (process.platform === "darwin") {
-                // Handle macOS zip file
-                execSync(`unzip -o "${archivePath}" -d "${this.streamingServerDir}"`, { encoding: "utf8" });
+                // SECURITY: use unzip via execFile (no shell).
+                await execFileAsync("unzip", ["-o", archivePath, "-d", this.streamingServerDir]);
                 chmodSync(ffmpegPath, 0o755);
                 unlinkSync(archivePath);
 
@@ -187,18 +270,35 @@ class StreamingServer {
                 await this.downloadFile(this.getMacOSFFprobeUrl(), ffprobeArchivePath);
                 this.logger.info("FFprobe archive downloaded. Extracting...");
                 
-                // Extract ffprobe
-                execSync(`unzip -o "${ffprobeArchivePath}" -d "${this.streamingServerDir}"`, { encoding: "utf8" });
+                await execFileAsync("unzip", ["-o", ffprobeArchivePath, "-d", this.streamingServerDir]);
                 chmodSync(ffprobePath, 0o755);
                 unlinkSync(ffprobeArchivePath);
                 return true;
             } else if (process.platform === "win32") {
-                // Handle Windows zip file natively to avoid PowerShell module issues
-                const fs = require('fs');
-                await new Promise<void>((resolve, reject) => {
-                    fs.createReadStream(archivePath)
-                        .pipe(unzipper.Extract({ path: this.streamingServerDir }))
-                        .on('close', resolve)
+                // Handle Windows zip file natively to avoid PowerShell module issues.
+                // SECURITY: unzipper.Extract by default does NOT validate
+                // entries against Zip Slip (path traversal via `..` or
+                // absolute paths).  We override the path inside our
+                // own validator and reject any entry that would land
+                // outside the destination directory.
+                await new Promise<void>((resolvePromise, reject) => {
+                    const destinationBase = resolve(this.streamingServerDir);
+                    const stream = require('fs').createReadStream(archivePath);
+                    stream
+                        .pipe(unzipper.Parse())
+                        .on('entry', (entry: any) => {
+                            const entryPath = entry.path as string;
+                            const targetPath = resolve(join(destinationBase, entryPath));
+                            const rel = relative(destinationBase, targetPath);
+                            // Reject any entry that escapes the destination.
+                            if (rel.startsWith('..') || isAbsolute(rel)) {
+                                this.logger.warn(`Refusing zip entry outside destination: ${entryPath}`);
+                                entry.autodrain();
+                                return;
+                            }
+                            entry.pipe(require('fs').createWriteStream(targetPath));
+                        })
+                        .on('close', resolvePromise)
                         .on('error', reject);
                 });
                 
@@ -206,15 +306,15 @@ class StreamingServer {
                 const ffmpegSource = join(extDir, "bin", "ffmpeg.exe");
                 const ffprobeSource = join(extDir, "bin", "ffprobe.exe");
                 
-                if (fs.existsSync(ffmpegSource)) {
-                    fs.renameSync(ffmpegSource, join(this.streamingServerDir, "ffmpeg.exe"));
+                if (existsSync(ffmpegSource)) {
+                    renameSync(ffmpegSource, join(this.streamingServerDir, "ffmpeg.exe"));
                 }
-                if (fs.existsSync(ffprobeSource)) {
-                    fs.renameSync(ffprobeSource, join(this.streamingServerDir, "ffprobe.exe"));
+                if (existsSync(ffprobeSource)) {
+                    renameSync(ffprobeSource, join(this.streamingServerDir, "ffprobe.exe"));
                 }
                 
-                if (fs.existsSync(extDir)) {
-                    fs.rmSync(extDir, { recursive: true, force: true });
+                if (existsSync(extDir)) {
+                    rmSync(extDir, { recursive: true, force: true });
                 }
 
                 unlinkSync(archivePath);
@@ -298,20 +398,38 @@ class StreamingServer {
     }
 
     private static async fetchText(url: string): Promise<string> {
+        const MAX_TEXT_BYTES = 8 * 1024 * 1024; // 8 MiB - version/toml files are tiny
         return new Promise((resolve, reject) => {
+            let redirects = 0;
             const request = (fetchUrl: string) => {
                 https.get(fetchUrl, { headers: { "User-Agent": "Stremio-Enhanced" } }, (res) => {
                     if (res.statusCode && res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+                        res.resume();
+                        if (++redirects > MAX_REDIRECTS) {
+                            reject(new Error(`Too many redirects fetching ${url}`));
+                            return;
+                        }
                         request(new URL(res.headers.location, fetchUrl).toString());
                         return;
                     }
                     if (res.statusCode !== 200) {
+                        res.resume();
                         reject(new Error(`HTTP ${res.statusCode}`));
                         return;
                     }
                     let data = '';
-                    res.on('data', chunk => data += chunk);
+                    let bytes = 0;
+                    res.on('data', chunk => {
+                        bytes += chunk.length;
+                        if (bytes > MAX_TEXT_BYTES) {
+                            res.destroy();
+                            reject(new Error(`Response from ${url} exceeded ${MAX_TEXT_BYTES} byte limit`));
+                            return;
+                        }
+                        data += chunk;
+                    });
                     res.on('end', () => resolve(data));
+                    res.on('error', err => reject(err));
                 }).on("error", err => reject(err));
             };
             request(url);

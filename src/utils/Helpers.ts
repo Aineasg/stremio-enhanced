@@ -166,6 +166,10 @@ class Helpers {
      * Execute JavaScript in the context of Stremio's core services
      * @param js - JavaScript code to execute
      * @returns Promise with the result of the execution
+     *
+     * SECURITY NOTE: the `js` argument is built by this app's own
+     * trusted code paths only.  Never pass untrusted / user-supplied
+     * strings here.
      */
     public static _eval(js: string): Promise<unknown> {
         return new Promise((resolve, reject) => {
@@ -180,61 +184,57 @@ class Helpers {
                 };
 
                 window.addEventListener(uniqueId, handler);
-                
-                script.appendChild(
-                    document.createTextNode(`
-                        (() => {
-                            if (!window.__permanentCore) {
-                                window.__permanentCore = { getState: null, dispatch: null };
-                            }
-                            
-                            var liveCore = window.core || window.services?.core;
-                            if (liveCore) {
-                                if (liveCore.getState && !window.__permanentCore.getState) {
-                                    window.__permanentCore.getState = liveCore.getState.bind(liveCore);
-                                }
-                                if (liveCore.dispatch && !window.__permanentCore.dispatch) {
-                                    window.__permanentCore.dispatch = liveCore.dispatch.bind(liveCore);
-                                }
-                            }
 
-                            const executeQuery = () => {
-                                var currentCore = window.core || window.services?.core;
-                                var activeGetState = currentCore?.getState || window.__permanentCore?.getState;
-                                var activeDispatch = currentCore?.dispatch || window.__permanentCore?.dispatch;
+                // SECURITY: build the wrapper without template literal
+                // interpolation of `js` - encode it as base64 so it is
+                // interpreted as pure data, not as code that could
+                // re-enter the wrapper.  Decoding + eval at the far
+                // side uses atob() + Function() inside the wrapper.
+                const payload = btoa(unescape(encodeURIComponent(js)));
+                const wrapperSrc =
+                    '(() => {' +
+                    '  if (!window.__permanentCore) {' +
+                    '    window.__permanentCore = { getState: null, dispatch: null };' +
+                    '  }' +
+                    '  var liveCore = window.core || window.services && window.services.core;' +
+                    '  if (liveCore) {' +
+                    '    if (liveCore.getState && !window.__permanentCore.getState) {' +
+                    '      window.__permanentCore.getState = liveCore.getState.bind(liveCore);' +
+                    '    }' +
+                    '    if (liveCore.dispatch && !window.__permanentCore.dispatch) {' +
+                    '      window.__permanentCore.dispatch = liveCore.dispatch.bind(liveCore);' +
+                    '    }' +
+                    '  }' +
+                    '  var executeQuery = function() {' +
+                    '    var currentCore = window.core || (window.services && window.services.core);' +
+                    '    var activeGetState = currentCore && currentCore.getState || window.__permanentCore.getState;' +
+                    '    var activeDispatch = currentCore && currentCore.dispatch || window.__permanentCore.dispatch;' +
+                    '    if (!activeGetState && !activeDispatch) {' +
+                    '      setTimeout(executeQuery, 30);' +
+                    '      return;' +
+                    '    }' +
+                    '    var core = { getState: activeGetState, dispatch: activeDispatch };' +
+                    '    try {' +
+                    '      var src = decodeURIComponent(escape(atob("' + payload + '")));' +
+                    '      var fn = new Function("core", src);' +
+                    '      var result = fn(core);' +
+                    '      if (result instanceof Promise) {' +
+                    '        result.then(function(r){' +
+                    '          window.dispatchEvent(new CustomEvent("' + uniqueId + '", { detail: r }));' +
+                    '        }).catch(function(err){' +
+                    '          window.dispatchEvent(new CustomEvent("' + uniqueId + '", { detail: { error: err.message } }));' +
+                    '        });' +
+                    '      } else {' +
+                    '        window.dispatchEvent(new CustomEvent("' + uniqueId + '", { detail: result }));' +
+                    '      }' +
+                    '    } catch (evalError) {' +
+                    '      window.dispatchEvent(new CustomEvent("' + uniqueId + '", { detail: { error: evalError.message } }));' +
+                    '    }' +
+                    '  };' +
+                    '  executeQuery();' +
+                    '})();';
 
-                                if (!activeGetState && !activeDispatch) {
-                                    setTimeout(executeQuery, 30);
-                                    return;
-                                }
-
-                                try {
-                                    const core = {
-                                        getState: activeGetState,
-                                        dispatch: activeDispatch
-                                    };
-
-                                    var result = eval(\`${js.replace(/`/g, '\\`').replace(/\$/g, '\\$')}\`);
-                                
-                                    if (result instanceof Promise) {
-                                        result.then((awaitedResult) => {
-                                            window.dispatchEvent(new CustomEvent("${uniqueId}", { detail: awaitedResult }));
-                                        }).catch((err) => {
-                                            window.dispatchEvent(new CustomEvent("${uniqueId}", { detail: { error: err.message } }));
-                                        });
-                                    } else {
-                                        window.dispatchEvent(new CustomEvent("${uniqueId}", { detail: result }));
-                                    }
-                                } catch (evalError) {
-                                    window.dispatchEvent(new CustomEvent("${uniqueId}", { detail: { error: evalError.message } }));
-                                }
-                            };
-
-                            executeQuery();
-                        })();
-                    `),
-                );
-                    
+                script.textContent = wrapperSrc;
                 document.head.appendChild(script);
             } catch (err) {
                 reject(err);

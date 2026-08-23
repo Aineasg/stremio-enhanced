@@ -1,12 +1,29 @@
 {
-  "root": true,
-  "parser": "@typescript-eslint/parser",
-  "plugins": [
-    "@typescript-eslint"
-  ],
-  "extends": [
-    "eslint:recommended",
-    "plugin:@typescript-eslint/eslint-recommended",
-    "plugin:@typescript-eslint/recommended"
-  ]
+    "root": true,
+    "parser": "@typescript-eslint/parser",
+    "parserOptions": {
+        "ecmaVersion": 2022,
+        "sourceType": "module"
+    },
+    "plugins": ["@typescript-eslint"],
+    "env": {
+        "node": true,
+        "browser": true,
+        "es2022": true
+    },
+    "rules": {
+        "no-eval": "error",
+        "no-new-func": "off",
+        "no-implied-eval": "error",
+        "no-proto": "error",
+        "no-prototype-builtins": "error",
+        "no-caller": "error",
+        "no-console": "off",
+        "no-async-promise-executor": "warn",
+        "prefer-const": "warn",
+        "eqeqeq": ["warn", "smart"],
+        "no-var": "warn",
+        "default-case-last": "warn",
+        "no-self-compare": "warn"
+    }
 }

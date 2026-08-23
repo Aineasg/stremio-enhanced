@@ -1,6 +1,7 @@
 import TemplateCache from '../../utils/templateCache';
 import PluginSettingSchema from '../../interfaces/PluginSettingSchema';
 import { FILE_EXTENSIONS } from '../../constants';
+import { escapeHtml } from '../../utils/sanitize';
 
 export const pluginOptionsModal = {
     
@@ -27,7 +28,7 @@ export const pluginOptionsModal = {
 
         return template
             .replace(/\{\{\s*modalId\s*\}\}/g, modalId)
-            .replace(/\{\{\s*pluginName\s*\}\}/g, pluginName.replace(FILE_EXTENSIONS.PLUGIN, ""))
+            .replace(/\{\{\s*pluginName\s*\}\}/g, escapeHtml(pluginName.replace(FILE_EXTENSIONS.PLUGIN, "")))
             .replace(/\{\{\s*settingsHtml\s*\}\}/g, settingsHtml);
     },
 
@@ -38,11 +39,11 @@ export const pluginOptionsModal = {
         return `
         <div class="option-vFOAS" style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
             <div class="heading-dYMDt" style="flex: 1; padding-right: 20px; min-width: 0;">
-                <div class="label-qI6Vh" style="font-size: 1.1em; white-space: normal; overflow: visible; text-overflow: clip; line-height: 1.4;">${setting.label}</div>
-                ${setting.description ? `<div style="font-size: 0.85em; color: #a0a0a0; margin-top: 4px; white-space: normal; line-height: 1.4;">${setting.description}</div>` : ''}
+                <div class="label-qI6Vh" style="font-size: 1.1em; white-space: normal; overflow: visible; text-overflow: clip; line-height: 1.4;">${escapeHtml(setting.label)}</div>
+                ${setting.description ? `<div style="font-size: 0.85em; color: #a0a0a0; margin-top: 4px; white-space: normal; line-height: 1.4;">${escapeHtml(setting.description)}</div>` : ''}
             </div>
             <div class="content-P2T0i" style="flex-shrink: 0;">
-                <div tabindex="0" class="toggle-container-lZfHP button-container-zVLH6 plugin-setting-toggle ${checkedClass}" data-key="${setting.key}" style="outline: none;">
+                <div tabindex="0" class="toggle-container-lZfHP button-container-zVLH6 plugin-setting-toggle ${checkedClass}" data-key="${escapeHtml(setting.key)}" style="outline: none;">
                     <div class="toggle-toOWM"></div>
                 </div>
             </div>
@@ -53,13 +54,13 @@ export const pluginOptionsModal = {
             return `
             <div class="option-vFOAS" style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
                 <div class="heading-dYMDt" style="flex: 1; padding-right: 20px; min-width: 0;">
-                    <div class="label-qI6Vh" style="font-size: 1.1em; white-space: normal; overflow: visible; text-overflow: clip; line-height: 1.4;">${setting.label}</div>
-                    ${setting.description ? `<div style="font-size: 0.85em; color: #a0a0a0; margin-top: 4px; white-space: normal; line-height: 1.4;">${setting.description}</div>` : ''}
+                    <div class="label-qI6Vh" style="font-size: 1.1em; white-space: normal; overflow: visible; text-overflow: clip; line-height: 1.4;">${escapeHtml(setting.label)}</div>
+                    ${setting.description ? `<div style="font-size: 0.85em; color: #a0a0a0; margin-top: 4px; white-space: normal; line-height: 1.4;">${escapeHtml(setting.description)}</div>` : ''}
                 </div>
                 
                 <div class="content-P2T0i" style="flex-shrink: 0; width: 50%; max-width: 300px;">
                     <label class="search-bar-k7MXd search-bar-container-p4tSt" style="width: 100%; padding: 0; margin: 0; display: block;">
-                        <input data-key="${setting.key}" size="1" autocorrect="off" autocapitalize="off" autocomplete="off" spellcheck="false" tabindex="0" class="search-input-bAgAh text-input-hnLiz plugin-setting-input" type="text" placeholder="${setting.label}" value="${currentValue}" style="width: 100%; box-sizing: border-box; height: 42px; padding: 0 15px;">
+                        <input data-key="${escapeHtml(setting.key)}" size="1" autocorrect="off" autocapitalize="off" autocomplete="off" spellcheck="false" tabindex="0" class="search-input-bAgAh text-input-hnLiz plugin-setting-input" type="text" placeholder="${escapeHtml(setting.label)}" value="${escapeHtml(currentValue)}" style="width: 100%; box-sizing: border-box; height: 42px; padding: 0 15px;">
                     </label>
                 </div>
             </div>`;
@@ -70,19 +71,19 @@ export const pluginOptionsModal = {
         if (setting.options) {
             setting.options.forEach((opt: { label: string; value: any }) => {
                 const selected = (opt.value === currentValue) ? 'selected' : '';
-                optionsHtml += `<option value="${opt.value}" ${selected} style="background-color: #1a1a1a; color: white;">${opt.label}</option>`;
+                optionsHtml += `<option value="${escapeHtml(String(opt.value))}" ${selected} style="background-color: #1a1a1a; color: white;">${escapeHtml(opt.label)}</option>`;
             });
         }
 
         return `
         <div class="option-vFOAS" style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
             <div class="heading-dYMDt" style="flex: 1; padding-right: 20px; min-width: 0;">
-                <div class="label-qI6Vh" style="font-size: 1.1em; white-space: normal; overflow: visible; text-overflow: clip; line-height: 1.4;">${setting.label}</div>
-                ${setting.description ? `<div style="font-size: 0.85em; color: #a0a0a0; margin-top: 4px; white-space: normal; line-height: 1.4;">${setting.description}</div>` : ''}
+                <div class="label-qI6Vh" style="font-size: 1.1em; white-space: normal; overflow: visible; text-overflow: clip; line-height: 1.4;">${escapeHtml(setting.label)}</div>
+                ${setting.description ? `<div style="font-size: 0.85em; color: #a0a0a0; margin-top: 4px; white-space: normal; line-height: 1.4;">${escapeHtml(setting.description)}</div>` : ''}
             </div>
             
             <div class="content-P2T0i" style="flex-shrink: 0; width: 50%; max-width: 300px;">
-                <select data-key="${setting.key}" class="search-input-bAgAh text-input-hnLiz plugin-setting-select" style="width: 100%; padding: 0 15px; cursor: pointer; background-color: rgba(255, 255, 255, 0.08); color: white; border: 1px solid transparent; border-radius: 20px; outline: none; appearance: auto; box-sizing: border-box; height: 42px;">
+                <select data-key="${escapeHtml(setting.key)}" class="search-input-bAgAh text-input-hnLiz plugin-setting-select" style="width: 100%; padding: 0 15px; cursor: pointer; background-color: rgba(255, 255, 255, 0.08); color: white; border: 1px solid transparent; border-radius: 20px; outline: none; appearance: auto; box-sizing: border-box; height: 42px;">
                     ${optionsHtml}
                 </select>
             </div>

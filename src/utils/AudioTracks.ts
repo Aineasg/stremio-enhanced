@@ -1,5 +1,6 @@
 import Helpers from "./Helpers";
 import { getLogger } from "./logger";
+import { escapeHtml } from "./sanitize";
 
 const logger = getLogger("AudioTracks");
 
@@ -20,29 +21,87 @@ class AudioTracks {
         const video = document.querySelector("video") as HTMLVideoElement;
         if (!video) return;
 
-        video.addEventListener("loadedmetadata", () => {
-            if (this.detectedAlready) return;
-            this.detectedAlready = true;
+        // FIX (race condition): if metadata is already loaded by the time
+        // we attach (fast loads / SPA navigation inside the player), the
+        // loadedmetadata event will never fire for us and the audio
+        // button stayed permanently grayed out. Detect immediately when
+        // readyState already has metadata.
+        if (video.readyState >= 1) {
+            this.detectTracks(video);
+            return;
+        }
 
-            const audioTracks = (video as any).audioTracks;
-            if (!audioTracks || audioTracks.length <= 1) {
-                logger.info(`No multiple audio tracks (${audioTracks?.length ?? 0}).`);
-                return;
-            }
-
-            logger.info(`Found ${audioTracks.length} native audio tracks.`);
-            this.enableAudioButton(audioTracks);
-        });
+        video.addEventListener("loadedmetadata", () => this.detectTracks(video));
     }
 
-    private static enableAudioButton(audioTracks: any) {
+    private static detectTracks(video: HTMLVideoElement): void {
+        if (this.detectedAlready) return;
+
+        const audioTracks = (video as any).audioTracks;
+        if (!audioTracks) {
+            logger.warn("video.audioTracks is unavailable yet (AudioVideoTracks feature not active?) - retrying...");
+            this.retryDetection(video, 1);
+            return;
+        }
+
+        // HLS multi-audio manifests are sometimes parsed slightly
+        // after loadedmetadata - re-check a few times before giving
+        // up so we don't miss tracks on slow loads.
+        if (audioTracks.length <= 1) {
+            logger.info(`Only ${audioTracks.length} audio track(s) visible at loadedmetadata; retrying...`);
+            this.retryDetection(video, 1);
+            return;
+        }
+
+        this.detectedAlready = true;
+        const langs: string[] = [];
+        for (let i = 0; i < audioTracks.length; i++) {
+            langs.push(audioTracks[i].language || "und");
+        }
+        logger.info(`Found ${audioTracks.length} native audio tracks: ${langs.join(", ")}`);
+        this.enableAudioButton(audioTracks);
+    }
+
+    private static retryDetection(video: HTMLVideoElement, attempt: number): void {
+        if (this.detectedAlready) return;
+        const audioTracks = (video as any).audioTracks;
+        if (audioTracks && audioTracks.length > 1) {
+            this.detectedAlready = true;
+            const langs: string[] = [];
+            for (let i = 0; i < audioTracks.length; i++) {
+                langs.push(audioTracks[i].language || "und");
+            }
+            logger.info(`Found ${audioTracks.length} native audio tracks on retry ${attempt}: ${langs.join(", ")}`);
+            this.enableAudioButton(audioTracks);
+            return;
+        }
+        if (attempt >= 8) {
+            this.detectedAlready = true;
+            logger.info(`No multiple audio tracks after ${attempt} checks (${audioTracks?.length ?? 0}). The stream likely has a single audio track, or the backend does not expose multi-audio HLS.`);
+            return;
+        }
+        setTimeout(() => this.retryDetection(video, attempt + 1), 1000);
+    }
+
+    private static async enableAudioButton(audioTracks: any) {
+        // The control bar renders some time after the video element -
+        // wait for it before looking for the audio button.
+        try {
+            await Helpers.waitForElm('[class*="control-bar-button"]', 15000);
+        } catch {
+            logger.warn("Control bar not found; cannot attach audio menu entry.");
+            return;
+        }
+
         const knownAudioSvgPrefixes = ['M57.48', 'M57,', 'M56', 'M58'];
-        const disabledButtons = document.querySelectorAll('[class*="control-bar-button"][class*="disabled"]');
+        const allButtons = document.querySelectorAll('[class*="control-bar-button"]');
         let audioButton: Element | null = null;
 
-        for (const btn of disabledButtons) {
-            const paths = btn.querySelectorAll('path');
-            for (const path of paths) {
+        // 1) Preferred: Stremio's own audio button, identified by its
+        //    speaker-icon SVG path prefix - regardless of whether it is
+        //    currently marked disabled or hidden.
+        for (const btn of Array.from(allButtons)) {
+            for (const path of Array.from(btn.querySelectorAll('path'))) {
                 const d = path.getAttribute('d') || '';
                 if (knownAudioSvgPrefixes.some(prefix => d.startsWith(prefix))) {
                     audioButton = btn;
@@ -52,29 +111,72 @@ class AudioTracks {
             if (audioButton) break;
         }
 
+        // 2) Legacy heuristic: the last disabled single-path button in
+        //    the control bar (the old behaviour).
         if (!audioButton) {
+            const disabledButtons = document.querySelectorAll('[class*="control-bar-button"][class*="disabled"]');
             for (let i = disabledButtons.length - 1; i >= 0; i--) {
-                const paths = disabledButtons[i].querySelectorAll('path');
-                if (paths.length === 1) {
+                if (disabledButtons[i].querySelectorAll('path').length === 1) {
                     audioButton = disabledButtons[i];
                     break;
                 }
             }
         }
 
-        if (!audioButton) {
-            logger.info("Could not find audio track button.");
+        if (audioButton) {
+            audioButton.className = audioButton.className.replace(/\bdisabled\b/g, '').trim();
+            // In case the button is hidden rather than disabled.
+            (audioButton as HTMLElement).style.display = '';
+            audioButton.addEventListener('click', (e) => {
+                e.stopPropagation();
+                e.preventDefault();
+                this.toggleMenu(audioTracks);
+            });
+            logger.info("Audio track button enabled (native Stremio button).");
             return;
         }
 
-        audioButton.className = audioButton.className.replace(/\bdisabled\b/g, '').trim();
-        logger.info("Audio track button enabled.");
+        // 3) Last resort: Stremio Web's markup changed enough that we
+        //    can't find their audio button - inject our own, styled to
+        //    match its neighbours, so language switching keeps working
+        //    across Stremio Web UI updates.
+        this.injectOwnAudioButton(audioTracks);
+    }
 
-        audioButton.addEventListener('click', (e) => {
+    /**
+     * Inject our own audio-tracks button into the player control bar.
+     * Used when Stremio Web's own audio button can't be identified
+     * (their UI/markup changes independently of this app).
+     */
+    private static injectOwnAudioButton(audioTracks: any): void {
+        if (document.getElementById('enhanced-audio-btn')) return;
+
+        const buttons = document.querySelectorAll('[class*="control-bar-button"]');
+        if (buttons.length === 0) {
+            logger.warn("No control bar buttons found to anchor our audio button.");
+            return;
+        }
+
+        const anchor = buttons[buttons.length - 1] as HTMLElement;
+        const btn = document.createElement('div');
+        btn.id = 'enhanced-audio-btn';
+        // Copy a working sibling's classes so it inherits Stremio's
+        // button styling (minus any disabled state).
+        btn.className = anchor.className.replace(/\bdisabled\b/g, '').trim();
+        btn.setAttribute('tabindex', '0');
+        btn.setAttribute('title', 'Audio tracks');
+        btn.setAttribute('aria-label', 'Audio tracks');
+        btn.style.cursor = 'pointer';
+        btn.innerHTML = `<svg viewBox="0 0 24 24"><path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02zM14 3.23v2.06c2.89.86 5 3.54 5 6.71s-2.11 5.85-5 6.71v2.06c4.01-.91 7-4.49 7-8.77s-2.99-7.86-7-8.77z" style="fill: currentcolor;"></path></svg>`;
+
+        btn.addEventListener('click', (e) => {
             e.stopPropagation();
             e.preventDefault();
             this.toggleMenu(audioTracks);
         });
+
+        anchor.after(btn);
+        logger.info("Injected custom audio track button into the control bar.");
     }
 
     private static injectStyles() {
@@ -219,10 +321,10 @@ class AudioTracks {
             const langName = this.getLanguageName(track.language);
             const isSelected = track.id === selectedId;
 
-            menuHTML += `<div class="eam-option${isSelected ? ' selected' : ''}" data-index="${i}" title="${track.label || langName}">`;
+            menuHTML += `<div class="eam-option${isSelected ? ' selected' : ''}" data-index="${i}" title="${escapeHtml(track.label || langName)}">`;
             menuHTML += `<div class="eam-info">`;
-            menuHTML += `<div class="eam-lang">${langName}</div>`;
-            menuHTML += `<div class="eam-label">${track.label || track.language || ''}</div>`;
+            menuHTML += `<div class="eam-lang">${escapeHtml(langName)}</div>`;
+            menuHTML += `<div class="eam-label">${escapeHtml(track.label || track.language || '')}</div>`;
             menuHTML += `</div>`;
             if (isSelected) {
                 menuHTML += `<div class="eam-icon"></div>`;

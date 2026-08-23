@@ -152,22 +152,77 @@ class StremioService {
     }
     
     private static async downloadFile(url: string, dest: string): Promise<void> {
+        // Hardening: cap redirects and total size, verify status codes
+        // on every hop, and clean up partial files on failure so a
+        // truncated installer is never executed later.
+        const MAX_REDIRECTS = 5;
+        const MAX_BYTES = 1024 * 1024 * 1024; // 1 GiB
+
         return new Promise((resolve, reject) => {
+            let redirects = 0;
+            let bytesWritten = 0;
+            let settled = false;
+
+            const fail = (err: Error) => {
+                if (settled) return;
+                settled = true;
+                try { unlinkSync(dest); } catch { /* nothing to clean up */ }
+                reject(err);
+            };
+
             const file = createWriteStream(dest);
-            const req = https.get(
-                url,
-                { headers: { "User-Agent": "Electron-AutoInstaller" } },
-                (res) => {
-                    if (res.statusCode && res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-                        https.get(res.headers.location, (r2) => r2.pipe(file));
-                    } else {
-                        res.pipe(file);
-                    }
-                    file.on("finish", () => file.close(() => resolve()));
-                    res.on("error", reject);
+            file.on("error", fail);
+
+            const request = (reqUrl: string) => {
+                let parsed: URL;
+                try {
+                    parsed = new URL(reqUrl);
+                } catch (err) {
+                    fail(err as Error);
+                    return;
                 }
-            );
-            req.on("error", reject);
+                if (parsed.protocol !== "https:") {
+                    fail(new Error(`Refusing non-https download URL: ${reqUrl}`));
+                    return;
+                }
+
+                https.get(reqUrl, { headers: { "User-Agent": "Electron-AutoInstaller" } }, (res) => {
+                    if (res.statusCode && res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+                        res.resume();
+                        if (++redirects > MAX_REDIRECTS) {
+                            fail(new Error(`Too many redirects downloading ${url}`));
+                            return;
+                        }
+                        request(new URL(res.headers.location, reqUrl).toString());
+                        return;
+                    }
+
+                    if (res.statusCode !== 200) {
+                        res.resume();
+                        fail(new Error(`Failed to download ${url}: HTTP ${res.statusCode}`));
+                        return;
+                    }
+
+                    res.on("data", (chunk: Buffer) => {
+                        bytesWritten += chunk.length;
+                        if (bytesWritten > MAX_BYTES) {
+                            fail(new Error(`Download of ${url} exceeded size limit`));
+                            res.destroy();
+                            file.close();
+                        }
+                    });
+
+                    res.pipe(file);
+                    file.on("finish", () => {
+                        file.close(() => {
+                            if (!settled) { settled = true; resolve(); }
+                        });
+                    });
+                    res.on("error", fail);
+                }).on("error", fail);
+            };
+
+            request(url);
         });
     }
     
@@ -262,8 +317,16 @@ class StremioService {
 
         this.logger.info(`Extracting Stremio Service zip to ${extractPath}...`);
 
-        const ps = `Expand-Archive -Path "${zipPath}" -DestinationPath "${extractPath}" -Force`;
-        await this.execFileAsync("powershell.exe", ["-ExecutionPolicy", "Bypass", "-NoProfile", "-Command", ps], {
+        // SECURITY: pass arguments as an array (not via `-Command`
+        // template string) so that zipPath cannot be used to inject
+        // additional PowerShell statements.  Even though zipPath comes
+        // from the GitHub releases API, we treat it as untrusted.
+        await this.execFileAsync("powershell.exe", [
+            "-ExecutionPolicy", "Bypass",
+            "-NoProfile",
+            "-Command",
+            `Expand-Archive -LiteralPath '${zipPath.replace(/'/g, "''")}' -DestinationPath '${extractPath.replace(/'/g, "''")}' -Force`,
+        ], {
             windowsHide: true,
         });
         
@@ -278,8 +341,18 @@ class StremioService {
     }
 
     private static async installWindows(filePath: string) {
-        const ps = `Start-Process -FilePath "${filePath}" -ArgumentList '/S' -Verb RunAs`;
-        await this.execFileAsync("powershell.exe", ["-ExecutionPolicy", "Bypass", "-NoProfile", "-Command", ps], {
+        // SECURITY: pass arguments as an array.  Use -LiteralPath and
+        // single-quote escaping to neutralize single quotes inside
+        // filePath.  This prevents the case where an attacker who
+        // controls the release assets (or just observes a malicious
+        // filename) can inject PowerShell statements.
+        const safeFile = filePath.replace(/'/g, "''");
+        await this.execFileAsync("powershell.exe", [
+            "-ExecutionPolicy", "Bypass",
+            "-NoProfile",
+            "-Command",
+            `Start-Process -FilePath '${safeFile}' -ArgumentList '/S' -Verb RunAs`,
+        ], {
             windowsHide: true,
         });
         

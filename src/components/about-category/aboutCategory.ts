@@ -1,6 +1,7 @@
 import TemplateCache from '../../utils/templateCache';
 import { VALID_RENDERERS } from '../../interfaces/RendererTypes';
 import { VALID_EXTERNAL_PLAYERS, type ExternalPlayer } from '../../interfaces/ExternalPlayerTypes';
+import { escapeHtml } from '../../utils/sanitize';
 
 export function getAboutCategoryTemplate(
     version: string,
@@ -14,8 +15,12 @@ export function getAboutCategoryTemplate(
 ): string {
     let template = TemplateCache.load(__dirname, 'about-category');
 
+    // SECURITY: version and custom paths can end up displayed in
+    // attributes / text - escape them defensively.  version is read
+    // from disk; vlc/mpv paths come from localStorage and are set by
+    // the user via the input fields below.
     template = template
-        .replace("{{ version }}", version)
+        .replace("{{ version }}", escapeHtml(version))
         .replace("{{ checkForUpdatesOnStartup }}", checkForUpdatesOnStartup ? "checked" : "")
         .replace("{{ discordrichpresence }}", discordRichPresence ? "checked" : "")
         .replace("{{ enableTransparentThemes }}", enableTransparentThemes ? "checked" : "")
@@ -38,8 +43,8 @@ export function getAboutCategoryTemplate(
     template = template
         .replace('{{ vlc_path_display }}', currentExternalPlayer === 'vlc' ? '' : 'none')
         .replace('{{ mpv_path_display }}', currentExternalPlayer === 'mpv' ? '' : 'none')
-        .replace('{{ vlc_custom_path }}', vlcCustomPath)
-        .replace('{{ mpv_custom_path }}', mpvCustomPath);
+        .replace('{{ vlc_custom_path }}', escapeHtml(vlcCustomPath))
+        .replace('{{ mpv_custom_path }}', escapeHtml(mpvCustomPath));
 
     return template;
 }

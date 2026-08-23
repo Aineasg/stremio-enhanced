@@ -9,7 +9,12 @@ const logger = getLogger("GPUController");
 
 export const gpuController = {
     setup: (userDataPath: string) => {
-        app.commandLine.appendSwitch('disable-features', 'UseChromeOSDirectVideoDecoder');
+        // NOTE: 'disable-features' is intentionally NOT appended here.
+        // Chromium keeps only the last value of a duplicated switch, so
+        // appending it again would silently discard the values set in
+        // main.ts (PNA overrides + UseChromeOSDirectVideoDecoder).  The
+        // combined value lives in main.ts - add new disabled features
+        // there.
 
         let enabledFeatures = [
             'PlatformHEVCDecoderSupport',
@@ -88,12 +93,26 @@ export const gpuController = {
         const bootConfigPath = join(userDataPath, 'boot-config.json');
 
         ipcMain.handle(IPC_CHANNELS.SET_GPU_RENDERER, (_, selectedRenderer: string) => {
+            // SECURITY: validate the renderer against the fixed
+            // allowlist.  Anything else is rejected so a malicious
+            // renderer / plugin can't write arbitrary strings into the
+            // boot config that later get concatenated into chromium
+            // command-line switches.
+            if (typeof selectedRenderer !== 'string' ||
+                !VALID_RENDERERS.includes(selectedRenderer as Renderer)) {
+                logger.error(`Rejected GPU renderer '${String(selectedRenderer)}' - not in allowlist.`);
+                return false;
+            }
+
             let config: { renderer: string } = { renderer: 'auto' };
 
             if (existsSync(bootConfigPath)) {
                 try {
                     const existingConfig = JSON.parse(readFileSync(bootConfigPath, 'utf-8'));
-                    config = { ...config, ...existingConfig };
+                    // Only copy known keys - prevents prototype pollution.
+                    if (existingConfig && typeof existingConfig === 'object' && !Array.isArray(existingConfig)) {
+                        config = { ...config, renderer: existingConfig.renderer ?? 'auto' };
+                    }
                 } catch (e) {
                     logger.error("Failed to parse existing boot config during update.");
                 }

@@ -43,16 +43,27 @@ export async function browseMods(): Promise<void> {
     const modsList = document.getElementById("mods-list");
     if (!modsList) return;
     
+    // ROBUSTNESS: render each item independently - a single malformed
+    // / hostile registry entry must not take down the whole marketplace
+    // page (the item template throws on unsafe names / URLs).
     for (const plugin of mods.plugins as any[]) {
-        const installed = ModManager.isPluginInstalled(Helpers.getFileNameFromUrl(plugin.download));
-        const template = await getModItemTemplate(plugin, "Plugin", installed);
-        modsList.insertAdjacentHTML("beforeend", template);
+        try {
+            const installed = ModManager.isPluginInstalled(Helpers.getFileNameFromUrl(plugin.download));
+            const template = await getModItemTemplate(plugin, "Plugin", installed);
+            modsList.insertAdjacentHTML("beforeend", template);
+        } catch (err) {
+            console.warn("Skipped malformed marketplace plugin entry:", err);
+        }
     }
 
     for (const theme of mods.themes as any[]) {
-        const installed = ModManager.isThemeInstalled(Helpers.getFileNameFromUrl(theme.download));
-        const template = await getModItemTemplate(theme, "Theme", installed);
-        modsList.insertAdjacentHTML("beforeend", template);
+        try {
+            const installed = ModManager.isThemeInstalled(Helpers.getFileNameFromUrl(theme.download));
+            const template = await getModItemTemplate(theme, "Theme", installed);
+            modsList.insertAdjacentHTML("beforeend", template);
+        } catch (err) {
+            console.warn("Skipped malformed marketplace theme entry:", err);
+        }
     }
     
     const actionBtns = document.querySelectorAll(".modActionBtn");

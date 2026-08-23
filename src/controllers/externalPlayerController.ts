@@ -1,6 +1,7 @@
 import * as net from 'net';
 import { existsSync } from 'fs';
 import { execFile } from 'child_process';
+import { resolve, isAbsolute, sep } from 'path';
 import { getLogger } from '../utils/logger';
 import { IPC_CHANNELS } from '../constants';
 import { ipcMain, BrowserWindow } from 'electron';
@@ -116,6 +117,57 @@ function startPolling(player: ExternalPlayer, child: ReturnType<typeof execFile>
     }, 5000);
 }
 
+/**
+ * Validate that `customPath` is an absolute, normalized path to a file
+ * we're allowed to execute.  This is permissive enough to accept the
+ * user's custom VLC/MPV location but blocks relative paths, parent
+ * traversal, and obviously malicious paths.
+ *
+ * Returns the resolved absolute path on success, or null on rejection.
+ */
+function validateCustomPlayerPath(customPath: string, expectedBasename: string): string | null {
+    if (typeof customPath !== 'string' || customPath.length === 0) return null;
+    if (customPath.length > 4096) return null;
+    if (customPath.includes('\0')) return null;
+    if (!isAbsolute(customPath)) return null;
+    // Reject paths that try to traverse up.
+    if (customPath.includes('..')) return null;
+    let resolved: string;
+    try {
+        resolved = resolve(customPath);
+    } catch {
+        return null;
+    }
+    // Make sure the basename ends with the expected binary name (vlc/mpv
+    // on Linux/macOS, vlc.exe/mpv.exe on Windows).  This blocks custom
+    // paths that point to cmd.exe, powershell, /bin/sh, etc.
+    const expected = process.platform === 'win32'
+        ? `${expectedBasename}.exe`
+        : expectedBasename;
+    const base = resolved.split(sep).pop() ?? '';
+    if (base.toLowerCase() !== expected.toLowerCase()) {
+        return null;
+    }
+    if (!existsSync(resolved)) return null;
+    return resolved;
+}
+
+/**
+ * Validate that `streamUrl` is a sensible URL that the external player
+ * is willing to open.  This blocks javascript:, file:, and very long
+ * URLs that could be used to abuse the player as a confused-deputy.
+ */
+function validateStreamUrl(streamUrl: string): boolean {
+    if (typeof streamUrl !== 'string') return false;
+    if (streamUrl.length === 0 || streamUrl.length > 8192) return false;
+    try {
+        const u = new URL(streamUrl);
+        return u.protocol === 'http:' || u.protocol === 'https:' || u.protocol === 'rtmp:' || u.protocol === 'rtsp:' || u.protocol === 'udp:' || u.protocol === 'rtp:';
+    } catch {
+        return false;
+    }
+}
+
 export const externalPlayerController = {
     initIPC: () => {
         ipcMain.handle(IPC_CHANNELS.LAUNCH_EXTERNAL_PLAYER, (_, player: string, streamUrl: string, customPath?: string) => {
@@ -124,7 +176,27 @@ export const externalPlayerController = {
                 return { success: false, error: `Invalid player: ${player}` };
             }
 
-            const playerPath = customPath || findPlayerPath(player as 'vlc' | 'mpv');
+            // SECURITY: validate stream URL before passing it to the
+            // external binary.  Players like mpv / vlc accept URL-style
+            // arguments, and we want to prevent any "javascript:" or
+            // "file:" payloads from being interpreted.
+            if (!validateStreamUrl(streamUrl)) {
+                logger.error(`Refused to launch external player with unsafe stream URL: ${String(streamUrl).slice(0, 256)}`);
+                return { success: false, error: 'Invalid stream URL.' };
+            }
+
+            const typedPlayer = player as 'vlc' | 'mpv';
+
+            // SECURITY: if a custom path is supplied, validate it before
+            // execFile.  Otherwise we'd be executing an arbitrary
+            // user-supplied binary.
+            let playerPath: string | null = null;
+            if (customPath && typeof customPath === 'string') {
+                playerPath = validateCustomPlayerPath(customPath, typedPlayer);
+            }
+            if (!playerPath) {
+                playerPath = findPlayerPath(typedPlayer);
+            }
             if (!playerPath) {
                 logger.error(`${player} not found at any known path.`);
                 return { success: false, error: `${player} not found. Please install it or set a custom path in settings.` };
@@ -139,11 +211,20 @@ export const externalPlayerController = {
                 pollInterval = null;
             }
 
-            const args = player === 'mpv'
+            // SECURITY: the args array is passed to execFile (not exec),
+            // so there is no shell to interpret.  We additionally make
+            // sure `streamUrl` cannot start with `--` (argument
+            // injection) by prefix-checking it.
+            if (streamUrl.startsWith('--')) {
+                logger.error('Refused to pass stream URL that looks like a CLI flag.');
+                return { success: false, error: 'Stream URL rejected.' };
+            }
+
+            const args = typedPlayer === 'mpv'
                 ? [streamUrl, `--input-ipc-server=${MPV_SOCKET}`]
                 : [streamUrl, '--extraintf=http', `--http-password=${VLC_HTTP_PASSWORD}`, `--http-port=${VLC_HTTP_PORT}`];
 
-            logger.info(`Launching ${player} at ${playerPath} with URL: ${streamUrl}`);
+            logger.info(`Launching ${player} at ${playerPath} with URL: ${streamUrl.slice(0, 128)}…`);
 
             const child = execFile(playerPath, args, (err) => {
                 if (err) logger.error(`Failed to launch ${player}: ${err.message}`);
@@ -160,7 +241,7 @@ export const externalPlayerController = {
                 if (win) win.webContents.send(IPC_CHANNELS.EXTERNAL_PLAYER_CLOSED);
             });
 
-            setTimeout(() => startPolling(player as ExternalPlayer, child), 2000);
+            setTimeout(() => startPolling(typedPlayer as ExternalPlayer, child), 2000);
 
             return { success: true };
         });

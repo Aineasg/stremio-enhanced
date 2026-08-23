@@ -31,7 +31,14 @@ const useStremioServiceFlagPath = join(app.getPath("userData"), "use_stremio_ser
 const useServerJSFlagPath = join(app.getPath("userData"), "use_server_js_for_streaming");
 const transparencyEnabled = existsSync(transparencyFlagPath);
 
-app.commandLine.appendSwitch('disable-features', 'BlockInsecurePrivateNetworkRequests,PrivateNetworkAccessSendPreflights');
+// FIX: `--disable-features` must be appended exactly ONCE.  Chromium
+// keeps only the last value of a duplicated switch, so the separate
+// 'UseChromeOSDirectVideoDecoder' entry that gpuController used to
+// append silently cancelled the Private-Network-Access overrides below
+// (breaking access to the local streaming server on newer Chromium).
+// All disabled features are now merged here; gpuController only
+// appends *other* switches.
+app.commandLine.appendSwitch('disable-features', 'BlockInsecurePrivateNetworkRequests,PrivateNetworkAccessSendPreflights,UseChromeOSDirectVideoDecoder');
 app.commandLine.appendSwitch('ignore-connections-limit', 'localhost,127.0.0.1');
 app.commandLine.appendSwitch('proxy-bypass-list', '127.0.0.1,localhost,::1');
 app.commandLine.appendSwitch('disable-background-timer-throttling');
@@ -60,15 +67,33 @@ if (!gotLock) {
 async function createWindow() {
     mainWindow = new BrowserWindow({
         webPreferences: {
-            preload: join(__dirname, "//preload/index.js"),
-            // Security Note: These settings are required for the plugin/theme system
-            // to work properly. The app loads web.stremio.com and needs to:
-            // 1. Make cross-origin requests to local streaming server (webSecurity: false)
-            // 2. Access Node.js APIs for file operations (nodeIntegration: true)
-            webSecurity: false,
-            nodeIntegration: true,
+            preload: join(__dirname, "preload", "index.js"),
+            // SECURITY: nodeIntegration MUST stay false.  The preload
+            // script exposes everything we need via contextBridge.
+            // Keeping nodeIntegration disabled prevents the remote
+            // stremio.com page (and any injected plugin/theme) from
+            // getting direct Node.js APIs.
+            nodeIntegration: false,
             contextIsolation: true,
-            // Additional security hardening/performance settings
+            // SECURITY ARCHITECTURE NOTE:
+            // The preload is a multi-file module (it requires ../core/*,
+            // ../utils/*, fs, path, child_process). Electron SANDBOXED
+            // preloads (sandbox: true) can only require a tiny builtin
+            // whitelist (electron/events/timers/url) and CANNOT load
+            // local module files - enabling sandbox here made the whole
+            // preload fail with "module not found ../core/Updater",
+            // silently killing plugins, themes, the Enhanced settings
+            // section and the audio-track feature.
+            // sandbox: false is safe in combination with
+            // nodeIntegration: false + contextIsolation: true: the page
+            // itself gets NO Node access; only the curated
+            // contextBridge API (StremioEnhancedAPI) is exposed to it.
+            sandbox: false,
+            // SECURITY: do NOT disable webSecurity.  Cross-origin
+            // requests to the local streaming server are routed via
+            // explicit proxies (the preload API + ipcRenderer) instead
+            // of weakening the same-origin policy globally.
+            webSecurity: true,
             allowRunningInsecureContent: false,
             experimentalFeatures: false,
             spellcheck: false,
@@ -102,9 +127,37 @@ async function createWindow() {
     }
     
     // Opens links in external browser instead of opening them in the Electron app.
-    mainWindow.webContents.setWindowOpenHandler((edata:any) => {
-        shell.openExternal(edata.url);
+    mainWindow.webContents.setWindowOpenHandler((edata: any) => {
+        // SECURITY: never let a remote page open arbitrary URLs.
+        // Only allow http(s) URLs to be delegated to the user's browser.
+        try {
+            const url = new URL(edata.url);
+            if (url.protocol !== "http:" && url.protocol !== "https:") {
+                logger.warn(`Blocked window-open for non-http(s) URL: ${edata.url}`);
+                return { action: "deny" };
+            }
+            shell.openExternal(edata.url);
+        } catch {
+            logger.warn(`Blocked window-open for malformed URL: ${String(edata.url)}`);
+            return { action: "deny" };
+        }
         return { action: "deny" };
+    });
+    
+    // SECURITY: block all attempts at navigation off the stremio origin.
+    // This catches <a target="_top"> style tricks, location redirects
+    // from compromised plugins, etc.
+    mainWindow.webContents.on('will-navigate', (event, url) => {
+        try {
+            const target = new URL(url);
+            const allowedHosts = ['web.stremio.com', 'www.stremio.com'];
+            if (!allowedHosts.includes(target.hostname.toLowerCase())) {
+                logger.warn(`Blocked navigation to off-origin URL: ${url}`);
+                event.preventDefault();
+            }
+        } catch {
+            event.preventDefault();
+        }
     });
     
     // Devtools flag
@@ -361,12 +414,38 @@ app.on('browser-window-created', (_, window) => {
 
 function handleStremioURL(url: string) {
     try {
-        console.log('Received stremio:// URL:', url);
-        
-        if (mainWindow && url.endsWith("/manifest.json")) {
-            mainWindow.loadURL(URLS.STREMIO_WEB_ADD_ADDON + encodeURIComponent(url));
+        if (typeof url !== 'string' || url.length > 4096) {
+            logger.warn(`Rejected stremio:// URL: invalid or too long`);
+            return;
         }
+
+        // SECURITY: validate the URL is really a stremio:// URL and
+        // does not contain any payload that could be used to trick
+        // web.stremio.com into loading unexpected content.
+        let parsed: URL;
+        try {
+            parsed = new URL(url);
+        } catch {
+            logger.warn(`Rejected malformed stremio:// URL: ${url}`);
+            return;
+        }
+
+        if (parsed.protocol !== 'stremio:') {
+            logger.warn(`Rejected non-stremio: protocol URL: ${url}`);
+            return;
+        }
+
+        // Only allow manifest.json addon-add URLs to be loaded.
+        if (!url.endsWith("/manifest.json")) {
+            logger.info(`Ignoring stremio:// URL without manifest: ${url}`);
+            return;
+        }
+
+        if (!mainWindow) return;
+
+        const safeAddonParam = encodeURIComponent(parsed.href);
+        mainWindow.loadURL(URLS.STREMIO_WEB_ADD_ADDON + safeAddonParam);
     } catch (err) {
-        console.error('Invalid stremio:// URL', err);
+        logger.error('Invalid stremio:// URL: ' + (err as Error).message);
     }
 }
